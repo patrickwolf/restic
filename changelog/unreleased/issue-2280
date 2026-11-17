@@ -1,0 +1,14 @@
+Enhancement: Resume interrupted backups without re-reading files
+
+When a backup was interrupted, the next run had to read all files again that
+were new or changed compared to the parent snapshot, even if they had already
+been uploaded. For large backups this could take hours or days.
+
+Restic now keeps an encrypted journal of the directories completed during a
+backup in its local cache. If the backup is interrupted, the next backup of
+the same paths from the same host no longer reads the unchanged files in
+these directories. The journal is removed once a backup completes. Resuming
+requires the cache and is not used together with `--force` or `--dry-run`.
+
+https://github.com/restic/restic/issues/2280
+https://github.com/restic/restic/pull/3230

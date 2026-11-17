@@ -948,7 +948,7 @@ func TestArchiverSaveDirDuplicateExcludedEntry(t *testing.T) {
 		arch.runWorkers(ctx, wg, uploader)
 		meta, err := testFS.OpenFile(".", fs.O_NOFOLLOW, true)
 		rtest.OK(t, err)
-		ft, err := arch.saveDir(ctx, "/", ".", meta, previousTree, nil)
+		ft, err := arch.saveDir(ctx, "/", ".", meta, []parentTree{{tree: previousTree}}, nil)
 		rtest.OK(t, err)
 		rtest.OK(t, meta.Close())
 

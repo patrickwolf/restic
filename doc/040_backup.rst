@@ -205,6 +205,22 @@ is possible to manually specify a specific parent snapshot using the
 ``--parent`` option. Finally, note that one would normally set the
 ``--group-by`` option for the ``forget`` command to the same value.
 
+If a backup is interrupted, the next backup of the same paths from the same
+host continues where the interrupted one left off: files in directories that
+were already completely processed are not read again, provided that they did
+not change in the meantime. For this, restic keeps a small encrypted journal
+of the completed directories in its local cache, which is removed once a
+backup completes. Resuming therefore requires the cache and is not used
+together with ``--force`` or ``--dry-run``. Data processed within about
+the last twenty minutes before the interruption may have to be read again, and
+running ``prune`` in between removes the data needed for resuming.
+The statistics of a resumed backup are still relative to the parent snapshot:
+files that were already uploaded by the interrupted backup are reported as
+new or changed, although they are not read again. If two backups of the same
+paths from the same host run at the same time, the first one to complete
+removes the journal; if the other one is interrupted afterwards, it cannot be
+resumed.
+
 Change detection is only performed for regular files (not special files,
 symlinks or directories) that have the exact same path as they did in a
 previous backup of the same location.  If a file or one of its containing

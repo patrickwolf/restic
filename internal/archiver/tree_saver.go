@@ -14,6 +14,8 @@ import (
 type treeSaver struct {
 	uploader restic.BlobSaverAsync
 	errFn    ErrorFunc
+	// completeTree is called with the snapshot path and ID of each saved tree.
+	completeTree func(ctx context.Context, snPath string, id restic.ID)
 
 	ch chan<- saveTreeJob
 }
@@ -184,6 +186,9 @@ func (s *treeSaver) worker(ctx context.Context, jobs <-chan saveTreeJob) error {
 			return err
 		}
 
+		if s.completeTree != nil {
+			s.completeTree(ctx, job.snPath, *node.Subtree)
+		}
 		if job.complete != nil {
 			job.complete(node, stats)
 		}

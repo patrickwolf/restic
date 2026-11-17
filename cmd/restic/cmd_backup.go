@@ -494,6 +494,32 @@ func findParentSnapshot(ctx context.Context, repo restic.ListerLoaderUnpacked, o
 	return sn, err
 }
 
+// openResumeJournal opens the journal of directories completed by an earlier,
+// interrupted backup of the same targets. It returns nil if there is no cache.
+func openResumeJournal(repo *repository.Repository, host string, targets []string) *archiver.ResumeJournal {
+	if repo.Cache() == nil {
+		return nil
+	}
+	abs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		a, err := filepath.Abs(target)
+		if err != nil {
+			return nil
+		}
+		abs = append(abs, a)
+	}
+	slices.Sort(abs)
+	name := restic.Hash([]byte(host + "\x00" + strings.Join(abs, "\x00"))).String()
+	path := filepath.Join(repo.Cache().BaseDir(), repo.Config().ID, "resume", name)
+
+	journal, err := archiver.OpenResumeJournal(path, repo.Key())
+	if err != nil {
+		debug.Log("unable to open resume journal: %v", err)
+		return nil
+	}
+	return journal
+}
+
 func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, term ui.Terminal, args []string) error {
 	var vsscfg fs.VSSConfig
 	var err error
@@ -554,16 +580,25 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 	}
 
 	var parentSnapshot *data.Snapshot
+	var journal *archiver.ResumeJournal
 	if !opts.Stdin {
 		parentSnapshot, err = findParentSnapshot(ctx, repo, opts, targets, timeStamp)
 		if err != nil {
 			return err
 		}
+		if !opts.StdinCommand && !opts.Force && !opts.DryRun {
+			journal = openResumeJournal(repo, opts.Host, targets)
+			// keep the journal for the next run unless the backup completes
+			defer journal.Close(false)
+		}
 
 		if !gopts.JSON {
+			if journal.Len() > 0 {
+				printer.P("resuming interrupted backup, %d directories were already completed\n", journal.Len())
+			}
 			if parentSnapshot != nil {
 				printer.P("using parent snapshot %v\n", parentSnapshot.ID().Str())
-			} else {
+			} else if journal.Len() == 0 {
 				printer.P("no parent snapshot found, will read all files\n")
 			}
 		}
@@ -655,6 +690,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 	arch.SelectByName = selectByNameFilter
 	arch.Select = selectFilter
 	arch.WithAtime = opts.WithAtime
+	arch.Journal = journal
 
 	arch.Error = func(item string, err error) error {
 		success = false
@@ -706,6 +742,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 	if err != nil {
 		return errors.Fatalf("unable to save snapshot: %v", err)
 	}
+	journal.Close(true)
 
 	// Report finished execution
 	progressReporter.Finish(id, summary, opts.DryRun)
