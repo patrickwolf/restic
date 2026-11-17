@@ -2787,7 +2787,7 @@ func TestArchiverParentPathRewrite(t *testing.T) {
 			_, _, summary, err := arch.Snapshot(ctx, []string{target}, SnapshotOptions{
 				Time:              time.Now(),
 				ParentSnapshot:    first,
-				ParentPathRewrite: map[string]string{"/new": "/old"},
+				ParentPathRewrite: map[string]string{"new": "old"},
 			})
 			rtest.OK(t, err)
 			rtest.Equals(t, map[string]int{}, testFS.bytesRead)

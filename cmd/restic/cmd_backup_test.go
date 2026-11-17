@@ -139,3 +139,18 @@ func TestReadFilenamesRaw(t *testing.T) {
 	rtest.Assert(t, strings.Contains(err.Error(), "zero byte"),
 		"wrong error message: %v", err.Error())
 }
+
+func TestRewriteTargets(t *testing.T) {
+	root, err := filepath.Abs(string(filepath.Separator))
+	rtest.OK(t, err)
+	p := func(elem ...string) string { return filepath.Join(append([]string{root}, elem...)...) }
+
+	rewrite, err := parseParentPathRewrite([]string{p("mnt", "old") + "=" + p("mnt", "new")})
+	rtest.OK(t, err)
+
+	got := rewriteTargets([]string{p("mnt", "new"), p("mnt", "new", "sub"), p("mnt", "newer"), p("other")}, rewrite)
+	rtest.Equals(t, []string{p("mnt", "old"), p("mnt", "old", "sub"), p("mnt", "newer"), p("other")}, got)
+
+	_, err = parseParentPathRewrite([]string{"missing-separator"})
+	rtest.Assert(t, err != nil, "expected error for invalid pair")
+}

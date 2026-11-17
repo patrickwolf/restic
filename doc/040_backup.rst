@@ -213,15 +213,17 @@ contents will be scanned again.
 
 If the backup location itself moved, for example because the mount point
 changed from ``/mnt/old`` to ``/mnt/new``, use ``--parent-path-rewrite`` to
-tell restic where to find the files in the parent snapshot. As the backup paths
-changed, the parent snapshot must be selected explicitly:
+tell restic where to find the files in the parent snapshot:
 
 .. code-block:: console
 
-    $ restic -r /srv/restic-repo backup /mnt/new --parent latest --parent-path-rewrite /mnt/old=/mnt/new
+    $ restic -r /srv/restic-repo backup /mnt/new --parent-path-rewrite /mnt/old=/mnt/new
 
-Paths are given as shown by ``restic ls``. The option can be specified multiple
-times.
+Paths are written the same way as the backup paths, for example
+``C:\old=D:\new`` on Windows. If no snapshot of the new paths exists yet,
+restic selects the latest snapshot of the old paths as parent. Once a snapshot
+of the new paths exists, it is used as parent instead, so the option can stay
+in a backup script. The option can be specified multiple times.
 
 Metadata changes (permissions, ownership, etc.) are always included in the
 backup, even if file contents are considered unchanged.

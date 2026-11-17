@@ -141,7 +141,7 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 		f.BoolVar(&opts.ExcludeCloudFiles, "exclude-cloud-files", false, "excludes online-only cloud files (such as OneDrive, iCloud drive, …)")
 	}
 	f.BoolVar(&opts.SkipIfUnchanged, "skip-if-unchanged", false, "skip snapshot creation if identical to parent snapshot")
-	f.StringArrayVar(&opts.ParentPathRewrite, "parent-path-rewrite", nil, "compare `old=new` path against old in the parent snapshot (paths as shown by 'restic ls'), e.g. after the mount point changed (can be specified multiple times). Combine with --parent or --group-by host to select the parent snapshot")
+	f.StringArrayVar(&opts.ParentPathRewrite, "parent-path-rewrite", nil, "compare `old=new` path against old in the parent snapshot (written like the backup paths), e.g. after the mount point changed (can be specified multiple times)")
 
 	opts.readConcurrencyFlag = f.Lookup("read-concurrency")
 
@@ -466,7 +466,7 @@ func collectTargets(opts BackupOptions, args []string, warnf func(msg string, ar
 	return filterExisting(targets, warnf)
 }
 
-// parseParentPathRewrite parses "old=new" pairs into a map from new to old snapshot path.
+// parseParentPathRewrite parses "old=new" pairs into a map from new to old path.
 func parseParentPathRewrite(pairs []string) (map[string]string, error) {
 	if len(pairs) == 0 {
 		return nil, nil
@@ -477,9 +477,32 @@ func parseParentPathRewrite(pairs []string) (map[string]string, error) {
 		if !ok || oldPath == "" || newPath == "" {
 			return nil, errors.Fatalf("invalid --parent-path-rewrite %q, expected old=new", p)
 		}
-		m[path.Clean("/"+filepath.ToSlash(newPath))] = path.Clean("/" + filepath.ToSlash(oldPath))
+		m[filepath.Clean(newPath)] = filepath.Clean(oldPath)
 	}
 	return m, nil
+}
+
+// rewriteTargets replaces the new path prefix of each target with the old one.
+func rewriteTargets(targets []string, rewrite map[string]string) []string {
+	abs := func(p string) string {
+		if a, err := filepath.Abs(p); err == nil {
+			return a
+		}
+		return filepath.Clean(p)
+	}
+	result := make([]string, 0, len(targets))
+	for _, target := range targets {
+		target = abs(target)
+		for newPath, oldPath := range rewrite {
+			rel, err := filepath.Rel(abs(newPath), target)
+			if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				target = filepath.Join(abs(oldPath), rel)
+				break
+			}
+		}
+		result = append(result, target)
+	}
+	return result
 }
 
 // parent returns the ID of the parent snapshot. If there is none, nil is
@@ -505,6 +528,15 @@ func findParentSnapshot(ctx context.Context, repo restic.ListerLoaderUnpacked, o
 	}
 
 	sn, _, err := f.FindLatest(ctx, repo, repo, snName)
+	if opts.Parent == "" && opts.GroupBy.Path && len(opts.ParentPathRewrite) > 0 && errors.Is(err, data.ErrNoSnapshotFound) {
+		// no snapshot of the new paths yet, look for one of the paths before the rewrite
+		rewrite, perr := parseParentPathRewrite(opts.ParentPathRewrite)
+		if perr != nil {
+			return nil, perr
+		}
+		f.Paths = rewriteTargets(targets, rewrite)
+		sn, _, err = f.FindLatest(ctx, repo, repo, snName)
+	}
 	// Snapshot not found is ok if no explicit parent was set
 	if opts.Parent == "" && errors.Is(err, data.ErrNoSnapshotFound) {
 		err = nil

@@ -667,6 +667,12 @@ func join(elem ...string) string {
 	return path.Join(elem...)
 }
 
+// snapshotPath returns the path p gets in the snapshot tree when used as a backup target.
+func (arch *Archiver) snapshotPath(p string) string {
+	pc, _ := pathComponents(arch.FS, p, false)
+	return "/" + strings.Join(pc, "/")
+}
+
 // findPrevious returns the node for name from the parent tree. If snPath/name
 // has a rewrite configured, the node is looked up at the rewritten path in the
 // parent snapshot instead.
@@ -870,8 +876,9 @@ type SnapshotOptions struct {
 	ProgramVersion string
 	// SkipIfUnchanged omits the snapshot creation if it is identical to the parent snapshot.
 	SkipIfUnchanged bool
-	// ParentPathRewrite maps a path in the new snapshot to the path of the same
-	// data in ParentSnapshot (e.g. after the mount point changed).
+	// ParentPathRewrite maps a path of the new backup to the path of the same
+	// data in ParentSnapshot (e.g. after the mount point changed). Paths are
+	// written like the backup targets.
 	ParentPathRewrite map[string]string
 }
 
@@ -932,7 +939,10 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 	}
 
 	arch.parentSnapshot = opts.ParentSnapshot
-	arch.parentRewrite = opts.ParentPathRewrite
+	arch.parentRewrite = make(map[string]string, len(opts.ParentPathRewrite))
+	for newPath, oldPath := range opts.ParentPathRewrite {
+		arch.parentRewrite[arch.snapshotPath(newPath)] = arch.snapshotPath(oldPath)
+	}
 
 	var rootTreeID restic.ID
 
