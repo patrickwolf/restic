@@ -299,12 +299,17 @@ type parentTree struct {
 	resumed bool
 }
 
-// firstNode returns the node of the first candidate, or nil.
-func firstNode(previous []parentNode) *data.Node {
-	if len(previous) == 0 {
-		return nil
+// statsNode returns the node that an item is compared against for the
+// statistics. Candidates from the resume journal are skipped, such that items
+// are reported as new or changed relative to the parent snapshots, as if the
+// interrupted backup had not happened.
+func statsNode(previous []parentNode) *data.Node {
+	for _, p := range previous {
+		if !p.resumed {
+			return p.node
+		}
 	}
-	return previous[0].node
+	return nil
 }
 
 // parentFinder looks up a name in several candidate trees at once.
@@ -619,6 +624,7 @@ func (arch *Archiver) save(ctx context.Context, snPath, target string, previous 
 		// in network filesystems)
 		// the first candidate that matches the file and is complete wins
 		contentsMissing := false
+		statsPrevious := statsNode(previous)
 		for _, p := range previous {
 			previous := p.node
 			if fileChanged(fi, previous, arch.ChangeIgnoreFlags) {
@@ -626,7 +632,7 @@ func (arch *Archiver) save(ctx context.Context, snPath, target string, previous 
 			}
 			if arch.allBlobsPresent(previous) {
 				debug.Log("%v hasn't changed, using old list of blobs", target)
-				arch.trackItem(snPath, previous, previous, ItemStats{}, time.Since(start))
+				arch.trackItem(snPath, statsPrevious, previous, ItemStats{}, time.Since(start))
 				arch.CompleteBlob(previous.Size)
 				node, err := arch.nodeFromFileInfo(snPath, target, meta, false)
 				if err != nil {
@@ -683,7 +689,7 @@ func (arch *Archiver) save(ctx context.Context, snPath, target string, previous 
 		}, func() {
 			arch.trackItem(snPath, nil, nil, ItemStats{}, 0)
 		}, func(node *data.Node, stats ItemStats) {
-			arch.trackItem(snPath, firstNode(previous), node, stats, time.Since(start))
+			arch.trackItem(snPath, statsNode(previous), node, stats, time.Since(start))
 		})
 
 	case fi.Mode.IsDir():
@@ -700,7 +706,7 @@ func (arch *Archiver) save(ctx context.Context, snPath, target string, previous 
 
 		fn, err = arch.saveDir(ctx, snPath, target, meta, oldSubtree,
 			func(node *data.Node, stats ItemStats) {
-				arch.trackItem(snItem, firstNode(previous), node, stats, time.Since(start))
+				arch.trackItem(snItem, statsNode(previous), node, stats, time.Since(start))
 			})
 		if err != nil {
 			debug.Log("SaveDir for %v returned error: %v", snPath, err)
@@ -843,7 +849,7 @@ func (arch *Archiver) saveTree(ctx context.Context, snPath string, atree *tree, 
 
 		// not a leaf node, archive subtree
 		fn, _, err := arch.saveTree(ctx, join(snPath, name), &subatree, oldSubtree, func(n *data.Node, is ItemStats) {
-			arch.trackItem(snItem, firstNode(oldNode), n, is, time.Since(start))
+			arch.trackItem(snItem, statsNode(oldNode), n, is, time.Since(start))
 		})
 		if err != nil {
 			err = arch.error(join(snPath, name), err)

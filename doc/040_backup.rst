@@ -219,6 +219,12 @@ of the completed directories in its local cache, which is removed once a
 backup completes. Resuming therefore requires the cache and is not used
 together with ``--force`` or ``--dry-run``. Data processed within roughly
 the last five minutes before the interruption may have to be read again.
+The statistics of a resumed backup are still relative to the parent snapshot:
+files that were already uploaded by the interrupted backup are reported as
+new or changed, although they are not read again. If two backups of the same
+paths from the same host run at the same time, the first one to complete
+removes the journal; if the other one is interrupted afterwards, it cannot be
+resumed.
 
 Change detection is only performed for regular files (not special files,
 symlinks or directories) that have the exact same path as they did in a

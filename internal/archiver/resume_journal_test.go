@@ -180,7 +180,8 @@ func TestArchiverResumeInterrupted(t *testing.T) {
 	_, summary, read := resumeTestSnapshot(t, repo, j, targets)
 	rtest.Assert(t, len(read) == 1, "wrong files read: %v", read)
 	rtest.Assert(t, read[filepath.Join("pending", "c")] > 0, "pending/c not read: %v", read)
-	rtest.Equals(t, ChangeStats{New: 1, Unchanged: 2}, summary.Files)
+	// statistics are relative to the parent snapshot, of which there is none
+	rtest.Equals(t, ChangeStats{New: 3}, summary.Files)
 	j.Close(true)
 
 	// the next run has neither journal nor parent
