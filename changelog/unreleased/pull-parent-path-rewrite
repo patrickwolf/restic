@@ -1,0 +1,7 @@
+Enhancement: Add `backup --parent-path-rewrite` to reuse a parent after a path change
+
+When the mount point or root folder of a backup changed, restic could not match
+files against the parent snapshot and had to read all files again. The new
+`--parent-path-rewrite old=new` option tells restic where the files of `new`
+are located in the parent snapshot, so unchanged files are not read again.
+Select the parent snapshot with `--parent` or `--group-by host`.

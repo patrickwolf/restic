@@ -2763,3 +2763,35 @@ func TestDisappearedFile(t *testing.T) {
 		rtest.Assert(t, excluded, "testfile should have been excluded")
 	}
 }
+
+func TestArchiverParentPathRewrite(t *testing.T) {
+	for _, target := range []string{"new", "."} {
+		t.Run(target, func(t *testing.T) {
+			ctx := t.Context()
+			tempdir, repo := prepareTempdirRepoSrc(t, TestDir{
+				"old": TestDir{"sub": TestDir{"file": TestFile{Content: string(rtest.Random(888, 1234))}}},
+			})
+			testFS := &MockFS{FS: fs.Track{FS: fs.NewLocal()}, bytesRead: make(map[string]int)}
+			arch := New(repo, testFS, Options{})
+			defer rtest.Chdir(t, tempdir)()
+
+			oldTarget := "old"
+			if target == "." {
+				oldTarget = "."
+			}
+			first, _, _, err := arch.Snapshot(ctx, []string{oldTarget}, SnapshotOptions{Time: time.Now()})
+			rtest.OK(t, err)
+
+			rtest.OK(t, os.Rename(filepath.Join(tempdir, "old"), filepath.Join(tempdir, "new")))
+			testFS.bytesRead = map[string]int{}
+			_, _, summary, err := arch.Snapshot(ctx, []string{target}, SnapshotOptions{
+				Time:              time.Now(),
+				ParentSnapshot:    first,
+				ParentPathRewrite: map[string]string{"/new": "/old"},
+			})
+			rtest.OK(t, err)
+			rtest.Equals(t, map[string]int{}, testFS.bytesRead)
+			rtest.Equals(t, ChangeStats{0, 0, 1}, summary.Files)
+		})
+	}
+}

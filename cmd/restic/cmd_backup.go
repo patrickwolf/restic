@@ -96,6 +96,7 @@ type BackupOptions struct {
 	ReadConcurrency   uint
 	NoScan            bool
 	SkipIfUnchanged   bool
+	ParentPathRewrite []string
 
 	readConcurrencyFlag *pflag.Flag
 }
@@ -140,6 +141,7 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 		f.BoolVar(&opts.ExcludeCloudFiles, "exclude-cloud-files", false, "excludes online-only cloud files (such as OneDrive, iCloud drive, …)")
 	}
 	f.BoolVar(&opts.SkipIfUnchanged, "skip-if-unchanged", false, "skip snapshot creation if identical to parent snapshot")
+	f.StringArrayVar(&opts.ParentPathRewrite, "parent-path-rewrite", nil, "compare `old=new` path against old in the parent snapshot (paths as shown by 'restic ls'), e.g. after the mount point changed (can be specified multiple times). Combine with --parent or --group-by host to select the parent snapshot")
 
 	opts.readConcurrencyFlag = f.Lookup("read-concurrency")
 
@@ -464,6 +466,22 @@ func collectTargets(opts BackupOptions, args []string, warnf func(msg string, ar
 	return filterExisting(targets, warnf)
 }
 
+// parseParentPathRewrite parses "old=new" pairs into a map from new to old snapshot path.
+func parseParentPathRewrite(pairs []string) (map[string]string, error) {
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	m := make(map[string]string, len(pairs))
+	for _, p := range pairs {
+		oldPath, newPath, ok := strings.Cut(p, "=")
+		if !ok || oldPath == "" || newPath == "" {
+			return nil, errors.Fatalf("invalid --parent-path-rewrite %q, expected old=new", p)
+		}
+		m[path.Clean("/"+filepath.ToSlash(newPath))] = path.Clean("/" + filepath.ToSlash(oldPath))
+	}
+	return m, nil
+}
+
 // parent returns the ID of the parent snapshot. If there is none, nil is
 // returned.
 func findParentSnapshot(ctx context.Context, repo restic.ListerLoaderUnpacked, opts BackupOptions, targets []string, timeStampLimit time.Time) (*data.Snapshot, error) {
@@ -511,6 +529,11 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 	}
 
 	err = opts.Check(gopts, args)
+	if err != nil {
+		return err
+	}
+
+	parentPathRewrite, err := parseParentPathRewrite(opts.ParentPathRewrite)
 	if err != nil {
 		return err
 	}
@@ -689,6 +712,8 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		ParentSnapshot:  parentSnapshot,
 		ProgramVersion:  "restic " + global.Version,
 		SkipIfUnchanged: opts.SkipIfUnchanged,
+
+		ParentPathRewrite: parentPathRewrite,
 	}
 
 	if !gopts.JSON {

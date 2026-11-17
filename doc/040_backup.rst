@@ -211,6 +211,18 @@ previous backup of the same location.  If a file or one of its containing
 directories was renamed, it is considered a different file and its entire
 contents will be scanned again.
 
+If the backup location itself moved, for example because the mount point
+changed from ``/mnt/old`` to ``/mnt/new``, use ``--parent-path-rewrite`` to
+tell restic where to find the files in the parent snapshot. As the backup paths
+changed, the parent snapshot must be selected explicitly:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo backup /mnt/new --parent latest --parent-path-rewrite /mnt/old=/mnt/new
+
+Paths are given as shown by ``restic ls``. The option can be specified multiple
+times.
+
 Metadata changes (permissions, ownership, etc.) are always included in the
 backup, even if file contents are considered unchanged.
 

@@ -101,6 +101,10 @@ type Archiver struct {
 	mu        sync.Mutex
 	summary   *Summary
 
+	// parentRewrite maps a snapshot path of the new snapshot to the path it had in parentSnapshot
+	parentRewrite  map[string]string
+	parentSnapshot *data.Snapshot
+
 	// Error is called for all errors that occur during backup.
 	Error ErrorFunc
 
@@ -335,7 +339,7 @@ func (arch *Archiver) saveDir(ctx context.Context, snPath string, dir string, me
 		}
 
 		pathname := arch.FS.Join(dir, name)
-		oldNode, err := finder.Find(name)
+		oldNode, err := arch.findPrevious(ctx, finder, snPath, name)
 		err = arch.error(pathname, err)
 		if err != nil {
 			return futureNode{}, err
@@ -663,6 +667,35 @@ func join(elem ...string) string {
 	return path.Join(elem...)
 }
 
+// findPrevious returns the node for name from the parent tree. If snPath/name
+// has a rewrite configured, the node is looked up at the rewritten path in the
+// parent snapshot instead.
+func (arch *Archiver) findPrevious(ctx context.Context, finder *data.TreeFinder, snPath, name string) (*data.Node, error) {
+	old, ok := arch.parentRewrite[join(snPath, name)]
+	if !ok || arch.parentSnapshot == nil || arch.parentSnapshot.Tree == nil {
+		return finder.Find(name)
+	}
+	debug.Log("using %v from parent snapshot for %v", old, join(snPath, name))
+	dirID, err := data.FindTreeDirectory(ctx, arch.Repo, arch.parentSnapshot.Tree, path.Dir(old))
+	if err != nil {
+		return nil, err
+	}
+	tree, err := data.LoadTree(ctx, arch.Repo, *dirID)
+	if err != nil {
+		return nil, err
+	}
+	oldFinder := data.NewTreeFinder(tree)
+	defer oldFinder.Close()
+	node, err := oldFinder.Find(path.Base(old))
+	if err != nil || node == nil {
+		return nil, err
+	}
+	// the node must carry the new name, otherwise it is treated as a different file
+	n := *node
+	n.Name = name
+	return &n, nil
+}
+
 // saveTree stores a Tree in the repo, returned is the tree. snPath is the path
 // within the current snapshot.
 func (arch *Archiver) saveTree(ctx context.Context, snPath string, atree *tree, previous data.TreeNodeIterator, complete fileCompleteFunc) (futureNode, int, error) {
@@ -702,7 +735,7 @@ func (arch *Archiver) saveTree(ctx context.Context, snPath string, atree *tree, 
 		// this is a leaf node
 		if subatree.Leaf() {
 			pathname := join(snPath, name)
-			oldNode, err := finder.Find(name)
+			oldNode, err := arch.findPrevious(ctx, finder, snPath, name)
 			err = arch.error(pathname, err)
 			if err != nil {
 				return futureNode{}, 0, err
@@ -727,7 +760,7 @@ func (arch *Archiver) saveTree(ctx context.Context, snPath string, atree *tree, 
 		snItem := join(snPath, name) + "/"
 		start := time.Now()
 
-		oldNode, err := finder.Find(name)
+		oldNode, err := arch.findPrevious(ctx, finder, snPath, name)
 		err = arch.error(snItem, err)
 		if err != nil {
 			return futureNode{}, 0, err
@@ -837,6 +870,9 @@ type SnapshotOptions struct {
 	ProgramVersion string
 	// SkipIfUnchanged omits the snapshot creation if it is identical to the parent snapshot.
 	SkipIfUnchanged bool
+	// ParentPathRewrite maps a path in the new snapshot to the path of the same
+	// data in ParentSnapshot (e.g. after the mount point changed).
+	ParentPathRewrite map[string]string
 }
 
 // loadParentTree loads a tree referenced by snapshot id. If id is null, nil is returned.
@@ -894,6 +930,9 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 	if err != nil {
 		return nil, restic.ID{}, nil, err
 	}
+
+	arch.parentSnapshot = opts.ParentSnapshot
+	arch.parentRewrite = opts.ParentPathRewrite
 
 	var rootTreeID restic.ID
 
