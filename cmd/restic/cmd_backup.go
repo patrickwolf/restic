@@ -71,7 +71,7 @@ Exit status is 12 if the password is incorrect.
 type BackupOptions struct {
 	filter.ExcludePatternOptions
 
-	Parent            string
+	Parents           []string
 	GroupBy           data.SnapshotGroupByOptions
 	Force             bool
 	ExcludeOtherFS    bool
@@ -101,7 +101,7 @@ type BackupOptions struct {
 }
 
 func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
-	f.StringVar(&opts.Parent, "parent", "", "use this parent `snapshot` (default: latest snapshot in the group determined by --group-by and not newer than the timestamp determined by --time)")
+	f.StringArrayVar(&opts.Parents, "parent", nil, "use this parent `snapshot` (default: latest snapshot in the group determined by --group-by and not newer than the timestamp determined by --time, can be specified multiple times)")
 	opts.GroupBy = data.SnapshotGroupByOptions{Host: true, Path: true}
 	f.VarP(&opts.GroupBy, "group-by", "g", "`group` snapshots by host, paths and/or tags, separated by comma (disable grouping with '')")
 	f.BoolVarP(&opts.Force, "force", "f", false, `force re-reading the source files/directories (overrides the "parent" flag)`)
@@ -464,17 +464,13 @@ func collectTargets(opts BackupOptions, args []string, warnf func(msg string, ar
 	return filterExisting(targets, warnf)
 }
 
-// parent returns the ID of the parent snapshot. If there is none, nil is
-// returned.
-func findParentSnapshot(ctx context.Context, repo restic.ListerLoaderUnpacked, opts BackupOptions, targets []string, timeStampLimit time.Time) (*data.Snapshot, error) {
+// findParentSnapshots returns the parent snapshots, the primary one first. If
+// there is none, nil is returned.
+func findParentSnapshots(ctx context.Context, repo restic.ListerLoaderUnpacked, opts BackupOptions, targets []string, timeStampLimit time.Time) ([]*data.Snapshot, error) {
 	if opts.Force {
 		return nil, nil
 	}
 
-	snName := opts.Parent
-	if snName == "" {
-		snName = "latest"
-	}
 	f := data.SnapshotFilter{TimestampLimit: timeStampLimit}
 	if opts.GroupBy.Host {
 		f.Hosts = []string{opts.Host}
@@ -486,12 +482,50 @@ func findParentSnapshot(ctx context.Context, repo restic.ListerLoaderUnpacked, o
 		f.Tags = []data.TagList{opts.Tags.Flatten()}
 	}
 
-	sn, _, err := f.FindLatest(ctx, repo, repo, snName)
-	// Snapshot not found is ok if no explicit parent was set
-	if opts.Parent == "" && errors.Is(err, data.ErrNoSnapshotFound) {
-		err = nil
+	if len(opts.Parents) == 0 {
+		sn, _, err := f.FindLatest(ctx, repo, repo, "latest")
+		// Snapshot not found is ok if no explicit parent was set
+		if errors.Is(err, data.ErrNoSnapshotFound) {
+			return nil, nil
+		}
+		return []*data.Snapshot{sn}, err
 	}
-	return sn, err
+
+	var parents []*data.Snapshot
+	for _, snName := range opts.Parents {
+		sn, _, err := f.FindLatest(ctx, repo, repo, snName)
+		if err != nil {
+			return nil, err
+		}
+		parents = append(parents, sn)
+	}
+	return parents, nil
+}
+
+// openResumeJournal opens the journal of directories completed by an earlier,
+// interrupted backup of the same targets. It returns nil if there is no cache.
+func openResumeJournal(repo *repository.Repository, host string, targets []string) *archiver.ResumeJournal {
+	if repo.Cache() == nil {
+		return nil
+	}
+	abs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		a, err := filepath.Abs(target)
+		if err != nil {
+			return nil
+		}
+		abs = append(abs, a)
+	}
+	slices.Sort(abs)
+	name := restic.Hash([]byte(host + "\x00" + strings.Join(abs, "\x00"))).String()
+	path := filepath.Join(repo.Cache().BaseDir(), repo.Config().ID, "resume", name)
+
+	journal, err := archiver.OpenResumeJournal(path, repo.Key())
+	if err != nil {
+		debug.Log("unable to open resume journal: %v", err)
+		return nil
+	}
+	return journal
 }
 
 func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, term ui.Terminal, args []string) error {
@@ -553,17 +587,26 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		return err
 	}
 
-	var parentSnapshot *data.Snapshot
+	var parentSnapshots []*data.Snapshot
+	var journal *archiver.ResumeJournal
 	if !opts.Stdin {
-		parentSnapshot, err = findParentSnapshot(ctx, repo, opts, targets, timeStamp)
+		parentSnapshots, err = findParentSnapshots(ctx, repo, opts, targets, timeStamp)
 		if err != nil {
 			return err
 		}
+		if !opts.StdinCommand && !opts.Force && !opts.DryRun {
+			journal = openResumeJournal(repo, opts.Host, targets)
+			// keep the journal for the next run unless the backup completes
+			defer journal.Close(false)
+		}
 
 		if !gopts.JSON {
-			if parentSnapshot != nil {
-				printer.P("using parent snapshot %v\n", parentSnapshot.ID().Str())
-			} else {
+			for _, sn := range parentSnapshots {
+				printer.P("using parent snapshot %v\n", sn.ID().Str())
+			}
+			if journal.Len() > 0 {
+				printer.P("resuming interrupted backup, %d directories were already completed\n", journal.Len())
+			} else if len(parentSnapshots) == 0 {
 				printer.P("no parent snapshot found, will read all files\n")
 			}
 		}
@@ -655,6 +698,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 	arch.SelectByName = selectByNameFilter
 	arch.Select = selectFilter
 	arch.WithAtime = opts.WithAtime
+	arch.Journal = journal
 
 	arch.Error = func(item string, err error) error {
 		success = false
@@ -686,7 +730,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		BackupStart:     backupStart,
 		Time:            timeStamp,
 		Hostname:        opts.Host,
-		ParentSnapshot:  parentSnapshot,
+		ParentSnapshots: parentSnapshots,
 		ProgramVersion:  "restic " + global.Version,
 		SkipIfUnchanged: opts.SkipIfUnchanged,
 	}
@@ -706,6 +750,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 	if err != nil {
 		return errors.Fatalf("unable to save snapshot: %v", err)
 	}
+	journal.Close(true)
 
 	// Report finished execution
 	progressReporter.Finish(id, summary, opts.DryRun)

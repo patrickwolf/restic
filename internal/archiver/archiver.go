@@ -101,6 +101,8 @@ type Archiver struct {
 	mu        sync.Mutex
 	summary   *Summary
 
+	lastPackFlush time.Time
+
 	// Error is called for all errors that occur during backup.
 	Error ErrorFunc
 
@@ -132,6 +134,10 @@ type Archiver struct {
 
 	// for excluded items
 	ExcludedItem func(path string)
+
+	// Journal records completed directories and provides those of an
+	// interrupted earlier run as additional parent candidates. May be nil.
+	Journal *ResumeJournal
 }
 
 // Flags for the ChangeIgnoreFlags bitfield.
@@ -278,21 +284,108 @@ func (arch *Archiver) nodeFromFileInfo(snPath, filename string, meta toNoder, ig
 	return node, err
 }
 
-// loadSubtree tries to load the subtree referenced by node. In case of an error, nil is returned.
-// If there is no node to load, then nil is returned without an error.
-func (arch *Archiver) loadSubtree(ctx context.Context, node *data.Node) (data.TreeNodeIterator, error) {
-	if node == nil || node.Type != data.NodeTypeDir || node.Subtree == nil {
-		return nil, nil
+// parentNode is a candidate previous version of an item. Several candidates
+// can exist for an item; they are tried in order.
+type parentNode struct {
+	node *data.Node
+	// resumed is set for candidates from the resume journal. These may
+	// reference blobs that were never uploaded, which is not an error.
+	resumed bool
+}
+
+// parentTree is a candidate previous version of a directory.
+type parentTree struct {
+	tree    data.TreeNodeIterator
+	resumed bool
+}
+
+// firstNode returns the node of the first candidate, or nil.
+func firstNode(previous []parentNode) *data.Node {
+	if len(previous) == 0 {
+		return nil
+	}
+	return previous[0].node
+}
+
+// parentFinder looks up a name in several candidate trees at once.
+type parentFinder struct {
+	finders []*data.TreeFinder
+	trees   []parentTree
+}
+
+func newParentFinder(trees []parentTree) *parentFinder {
+	f := &parentFinder{trees: trees}
+	for _, t := range trees {
+		f.finders = append(f.finders, data.NewTreeFinder(t.tree))
+	}
+	return f
+}
+
+// Find returns the nodes called name from all candidate trees that have one,
+// in candidate order. Names must be requested in strictly increasing order.
+func (f *parentFinder) Find(name string) ([]parentNode, error) {
+	var nodes []parentNode
+	for i, finder := range f.finders {
+		node, err := finder.Find(name)
+		if err != nil {
+			return nil, err
+		}
+		if node != nil {
+			nodes = append(nodes, parentNode{node: node, resumed: f.trees[i].resumed})
+		}
+	}
+	return nodes, nil
+}
+
+func (f *parentFinder) Close() {
+	for _, finder := range f.finders {
+		finder.Close()
+	}
+}
+
+// loadSubtrees loads the candidate previous versions of the directory at
+// snPath: the tree from the resume journal, if any, followed by the subtrees
+// of all previous nodes that are directories. Trees that could be loaded are
+// returned even if an error occurred for another one.
+func (arch *Archiver) loadSubtrees(ctx context.Context, snPath string, previous []parentNode) ([]parentTree, error) {
+	var trees []parentTree
+	var firstErr error
+	seen := make(map[restic.ID]int)
+
+	add := func(id restic.ID, resumed bool) {
+		if i, ok := seen[id]; ok {
+			if i >= 0 && !resumed {
+				trees[i].resumed = false
+			}
+			return
+		}
+		seen[id] = -1
+		if _, ok := arch.Repo.LookupBlobSize(restic.BlobHandle{Type: restic.TreeBlob, ID: id}); !ok && resumed {
+			debug.Log("resumed tree %v for %v is not in the index, skipping", id.Str(), snPath)
+			return
+		}
+		tree, err := data.LoadTree(ctx, arch.Repo, id)
+		if err != nil {
+			debug.Log("unable to load tree %v: %v", id.Str(), err)
+			// a tree in the repository is not readable -> warn the user
+			if !resumed && firstErr == nil {
+				firstErr = arch.wrapLoadTreeError(id, err)
+			}
+			return
+		}
+		seen[id] = len(trees)
+		trees = append(trees, parentTree{tree: tree, resumed: resumed})
 	}
 
-	tree, err := data.LoadTree(ctx, arch.Repo, *node.Subtree)
-	if err != nil {
-		debug.Log("unable to load tree %v: %v", node.Subtree.Str(), err)
-		// a tree in the repository is not readable -> warn the user
-		return nil, arch.wrapLoadTreeError(*node.Subtree, err)
+	if id, ok := arch.Journal.Lookup(snPath); ok {
+		add(id, true)
 	}
-
-	return tree, nil
+	for _, p := range previous {
+		if p.node.Type == data.NodeTypeDir && p.node.Subtree != nil {
+			add(*p.node.Subtree, p.resumed)
+		}
+	}
+	return trees, firstErr
 }
 
 func (arch *Archiver) wrapLoadTreeError(id restic.ID, err error) error {
@@ -306,7 +399,7 @@ func (arch *Archiver) wrapLoadTreeError(id restic.ID, err error) error {
 
 // saveDir stores a directory in the repo and returns the node. snPath is the
 // path within the current snapshot.
-func (arch *Archiver) saveDir(ctx context.Context, snPath string, dir string, meta fs.File, previous data.TreeNodeIterator, complete fileCompleteFunc) (d futureNode, err error) {
+func (arch *Archiver) saveDir(ctx context.Context, snPath string, dir string, meta fs.File, previous []parentTree, complete fileCompleteFunc) (d futureNode, err error) {
 	debug.Log("%v %v", snPath, dir)
 
 	treeNode, names, err := arch.dirToNodeAndEntries(snPath, dir, meta)
@@ -316,7 +409,7 @@ func (arch *Archiver) saveDir(ctx context.Context, snPath string, dir string, me
 
 	nodes := make([]futureNode, 0, len(names))
 
-	finder := data.NewTreeFinder(previous)
+	finder := newParentFinder(previous)
 	defer finder.Close()
 
 	var lastExcluded string
@@ -460,10 +553,10 @@ func (arch *Archiver) allBlobsPresent(previous *data.Node) bool {
 //
 // explicit is true when this path was a backup target (tree leaf with Explicit
 // set); Excludes (`SelectByName` and `Select`) are skipped for that path only.
-func (arch *Archiver) save(ctx context.Context, snPath, target string, previous *data.Node, explicit bool) (fn futureNode, excluded bool, err error) {
+func (arch *Archiver) save(ctx context.Context, snPath, target string, previous []parentNode, explicit bool) (fn futureNode, excluded bool, err error) {
 	start := time.Now()
 
-	debug.Log("%v target %q, previous %v", snPath, target, previous)
+	debug.Log("%v target %q, %d previous", snPath, target, len(previous))
 	abstarget, err := arch.FS.Abs(target)
 	if err != nil {
 		return futureNode{}, false, err
@@ -524,7 +617,13 @@ func (arch *Archiver) save(ctx context.Context, snPath, target string, previous 
 
 		// check if the file has not changed before performing a fopen operation (more expensive, specially
 		// in network filesystems)
-		if previous != nil && !fileChanged(fi, previous, arch.ChangeIgnoreFlags) {
+		// the first candidate that matches the file and is complete wins
+		contentsMissing := false
+		for _, p := range previous {
+			previous := p.node
+			if fileChanged(fi, previous, arch.ChangeIgnoreFlags) {
+				continue
+			}
 			if arch.allBlobsPresent(previous) {
 				debug.Log("%v hasn't changed, using old list of blobs", target)
 				arch.trackItem(snPath, previous, previous, ItemStats{}, time.Since(start))
@@ -544,7 +643,9 @@ func (arch *Archiver) save(ctx context.Context, snPath, target string, previous 
 				})
 				return fn, false, nil
 			}
-
+			contentsMissing = contentsMissing || !p.resumed
+		}
+		if contentsMissing {
 			debug.Log("%v hasn't changed, but contents are missing!", target)
 			// There are contents missing - inform user!
 			err := errors.Errorf("parts of %v not found in the repository index; storing the file again", target)
@@ -582,14 +683,14 @@ func (arch *Archiver) save(ctx context.Context, snPath, target string, previous 
 		}, func() {
 			arch.trackItem(snPath, nil, nil, ItemStats{}, 0)
 		}, func(node *data.Node, stats ItemStats) {
-			arch.trackItem(snPath, previous, node, stats, time.Since(start))
+			arch.trackItem(snPath, firstNode(previous), node, stats, time.Since(start))
 		})
 
 	case fi.Mode.IsDir():
 		debug.Log("  %v dir", target)
 
 		snItem := snPath + "/"
-		oldSubtree, err := arch.loadSubtree(ctx, previous)
+		oldSubtree, err := arch.loadSubtrees(ctx, snPath, previous)
 		if err != nil {
 			err = arch.error(abstarget, err)
 		}
@@ -599,7 +700,7 @@ func (arch *Archiver) save(ctx context.Context, snPath, target string, previous 
 
 		fn, err = arch.saveDir(ctx, snPath, target, meta, oldSubtree,
 			func(node *data.Node, stats ItemStats) {
-				arch.trackItem(snItem, previous, node, stats, time.Since(start))
+				arch.trackItem(snItem, firstNode(previous), node, stats, time.Since(start))
 			})
 		if err != nil {
 			debug.Log("SaveDir for %v returned error: %v", snPath, err)
@@ -665,7 +766,7 @@ func join(elem ...string) string {
 
 // saveTree stores a Tree in the repo, returned is the tree. snPath is the path
 // within the current snapshot.
-func (arch *Archiver) saveTree(ctx context.Context, snPath string, atree *tree, previous data.TreeNodeIterator, complete fileCompleteFunc) (futureNode, int, error) {
+func (arch *Archiver) saveTree(ctx context.Context, snPath string, atree *tree, previous []parentTree, complete fileCompleteFunc) (futureNode, int, error) {
 
 	var node *data.Node
 	if snPath != "/" {
@@ -687,7 +788,7 @@ func (arch *Archiver) saveTree(ctx context.Context, snPath string, atree *tree, 
 	nodeNames := atree.NodeNames()
 	nodes := make([]futureNode, 0, len(nodeNames))
 
-	finder := data.NewTreeFinder(previous)
+	finder := newParentFinder(previous)
 	defer finder.Close()
 
 	// iterate over the nodes of atree in lexicographic (=deterministic) order
@@ -732,7 +833,7 @@ func (arch *Archiver) saveTree(ctx context.Context, snPath string, atree *tree, 
 		if err != nil {
 			return futureNode{}, 0, err
 		}
-		oldSubtree, err := arch.loadSubtree(ctx, oldNode)
+		oldSubtree, err := arch.loadSubtrees(ctx, join(snPath, name), oldNode)
 		if err != nil {
 			err = arch.error(join(snPath, name), err)
 		}
@@ -742,7 +843,7 @@ func (arch *Archiver) saveTree(ctx context.Context, snPath string, atree *tree, 
 
 		// not a leaf node, archive subtree
 		fn, _, err := arch.saveTree(ctx, join(snPath, name), &subatree, oldSubtree, func(n *data.Node, is ItemStats) {
-			arch.trackItem(snItem, oldNode, n, is, time.Since(start))
+			arch.trackItem(snItem, firstNode(oldNode), n, is, time.Since(start))
 		})
 		if err != nil {
 			err = arch.error(join(snPath, name), err)
@@ -828,36 +929,66 @@ func resolveRelativeTargets(filesys fs.FS, targets []string) ([]backupTarget, er
 
 // SnapshotOptions collect attributes for a new snapshot.
 type SnapshotOptions struct {
-	Tags           data.TagList
-	Hostname       string
-	Excludes       []string
-	BackupStart    time.Time
-	Time           time.Time
-	ParentSnapshot *data.Snapshot
-	ProgramVersion string
+	Tags        data.TagList
+	Hostname    string
+	Excludes    []string
+	BackupStart time.Time
+	Time        time.Time
+	// ParentSnapshots are consulted in order to find unchanged files. The
+	// first one is recorded as the parent of the new snapshot.
+	ParentSnapshots []*data.Snapshot
+	ProgramVersion  string
 	// SkipIfUnchanged omits the snapshot creation if it is identical to the parent snapshot.
 	SkipIfUnchanged bool
 }
 
-// loadParentTree loads a tree referenced by snapshot id. If id is null, nil is returned.
-func (arch *Archiver) loadParentTree(ctx context.Context, sn *data.Snapshot) data.TreeNodeIterator {
-	if sn == nil {
-		return nil
-	}
+// packFlushInterval is how often partially filled packs are uploaded while a
+// resume journal is in use. It bounds the work lost by an interruption.
+var packFlushInterval = 5 * time.Minute
 
-	if sn.Tree == nil {
-		debug.Log("snapshot %v has empty tree %v", *sn.ID())
-		return nil
+// treeSaved is called by the tree workers for every directory that was saved.
+func (arch *Archiver) treeSaved(ctx context.Context, snPath string, id restic.ID) {
+	if arch.Journal == nil {
+		return
 	}
+	arch.Journal.Add(snPath, id)
 
-	debug.Log("load parent tree %v", *sn.Tree)
-	tree, err := data.LoadTree(ctx, arch.Repo, *sn.Tree)
+	// Packs are only uploaded once they are full, which takes very long for
+	// tree packs. Without flushing them, the journaled trees would be lost
+	// when the backup is interrupted.
+	arch.mu.Lock()
+	due := time.Since(arch.lastPackFlush) >= packFlushInterval
+	if due {
+		arch.lastPackFlush = time.Now()
+	}
+	arch.mu.Unlock()
+	if !due {
+		return
+	}
+	if f, ok := arch.Repo.(interface {
+		FlushPendingPacks(ctx context.Context) error
+	}); ok {
+		if err := f.FlushPendingPacks(ctx); err != nil {
+			debug.Log("flushing packs failed: %v", err)
+		}
+	}
+}
+
+// loadParentTrees loads the root trees of the parent snapshots and of the
+// resume journal. Trees that cannot be loaded are reported and skipped.
+func (arch *Archiver) loadParentTrees(ctx context.Context, parents []*data.Snapshot) []parentTree {
+	var roots []parentNode
+	for _, sn := range parents {
+		if sn.Tree == nil {
+			continue
+		}
+		roots = append(roots, parentNode{node: &data.Node{Type: data.NodeTypeDir, Subtree: sn.Tree}})
+	}
+	trees, err := arch.loadSubtrees(ctx, "/", roots)
 	if err != nil {
-		debug.Log("unable to load tree %v: %v", *sn.Tree, err)
-		_ = arch.error("/", arch.wrapLoadTreeError(*sn.Tree, err))
-		return nil
+		_ = arch.error("/", err)
 	}
-	return tree
+	return trees
 }
 
 // runWorkers starts the worker pools, which are stopped when the context is cancelled.
@@ -870,6 +1001,8 @@ func (arch *Archiver) runWorkers(ctx context.Context, wg *errgroup.Group, upload
 	arch.fileSaver.NodeFromFileInfo = arch.nodeFromFileInfo
 
 	arch.treeSaver = newTreeSaver(ctx, wg, arch.Options.SaveTreeConcurrency, uploader, arch.Error)
+	arch.treeSaver.completeTree = arch.treeSaved
+	arch.lastPackFlush = time.Now()
 }
 
 func (arch *Archiver) stopWorkers() {
@@ -905,7 +1038,7 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 			arch.runWorkers(wgCtx, wg, uploader)
 
 			debug.Log("starting snapshot")
-			fn, nodeCount, err := arch.saveTree(wgCtx, "/", atree, arch.loadParentTree(wgCtx, opts.ParentSnapshot), func(_ *data.Node, is ItemStats) {
+			fn, nodeCount, err := arch.saveTree(wgCtx, "/", atree, arch.loadParentTrees(wgCtx, opts.ParentSnapshots), func(_ *data.Node, is ItemStats) {
 				arch.trackItem("/", nil, nil, is, time.Since(start))
 			})
 			if err != nil {
@@ -943,8 +1076,8 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 		return nil, restic.ID{}, nil, err
 	}
 
-	if opts.ParentSnapshot != nil && opts.SkipIfUnchanged {
-		ps := opts.ParentSnapshot
+	if len(opts.ParentSnapshots) > 0 && opts.SkipIfUnchanged {
+		ps := opts.ParentSnapshots[0]
 		if ps.Tree != nil && rootTreeID.Equal(*ps.Tree) {
 			arch.summary.BackupEnd = time.Now()
 			return nil, restic.ID{}, arch.summary, nil
@@ -958,8 +1091,8 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 
 	sn.ProgramVersion = opts.ProgramVersion
 	sn.Excludes = opts.Excludes
-	if opts.ParentSnapshot != nil {
-		sn.Parent = opts.ParentSnapshot.ID()
+	if len(opts.ParentSnapshots) > 0 {
+		sn.Parent = opts.ParentSnapshots[0].ID()
 	}
 	sn.Tree = &rootTreeID
 	arch.summary.BackupEnd = time.Now()

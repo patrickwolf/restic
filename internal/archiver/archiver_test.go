@@ -948,7 +948,7 @@ func TestArchiverSaveDirDuplicateExcludedEntry(t *testing.T) {
 		arch.runWorkers(ctx, wg, uploader)
 		meta, err := testFS.OpenFile(".", fs.O_NOFOLLOW, true)
 		rtest.OK(t, err)
-		ft, err := arch.saveDir(ctx, "/", ".", meta, previousTree, nil)
+		ft, err := arch.saveDir(ctx, "/", ".", meta, []parentTree{{tree: previousTree}}, nil)
 		rtest.OK(t, err)
 		rtest.OK(t, meta.Close())
 
@@ -2003,7 +2003,7 @@ func TestArchiverParent(t *testing.T) {
 
 			opts = test.opts
 			opts.Time = time.Now()
-			opts.ParentSnapshot = firstSnapshot
+			opts.ParentSnapshots = []*data.Snapshot{firstSnapshot}
 			testFS.bytesRead = map[string]int{}
 			secondSnapshot, secondSnapshotID, summary, err := arch.Snapshot(ctx, []string{"."}, opts)
 			if err != nil {
@@ -2413,9 +2413,9 @@ func snapshot(t testing.TB, repo archiverRepo, fs fs.FS, parent *data.Snapshot, 
 
 	arch := New(repo, fs, Options{})
 
-	sopts := SnapshotOptions{
-		Time:           time.Now(),
-		ParentSnapshot: parent,
+	sopts := SnapshotOptions{Time: time.Now()}
+	if parent != nil {
+		sopts.ParentSnapshots = []*data.Snapshot{parent}
 	}
 	snapshot, _, _, err := arch.Snapshot(ctx, []string{filename}, sopts)
 	rtest.OK(t, err)

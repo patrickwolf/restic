@@ -87,7 +87,7 @@ func testBackup(t *testing.T, useFsSnapshot bool) {
 
 	testRunCheck(t, env.gopts)
 	// third backup, explicit incremental
-	opts.Parent = snapshotIDs[0].String()
+	opts.Parents = []string{snapshotIDs[0].String()}
 	testRunBackup(t, "", []string{env.testdata}, opts, env.gopts)
 	snapshotIDs = testListSnapshots(t, env.gopts, 3)
 
