@@ -71,7 +71,7 @@ Exit status is 12 if the password is incorrect.
 type BackupOptions struct {
 	filter.ExcludePatternOptions
 
-	Parents           []string
+	Parent            string
 	GroupBy           data.SnapshotGroupByOptions
 	Force             bool
 	ExcludeOtherFS    bool
@@ -101,7 +101,7 @@ type BackupOptions struct {
 }
 
 func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
-	f.StringArrayVar(&opts.Parents, "parent", nil, "use this parent `snapshot` (default: latest snapshot in the group determined by --group-by and not newer than the timestamp determined by --time, can be specified multiple times)")
+	f.StringVar(&opts.Parent, "parent", "", "use this parent `snapshot` (default: latest snapshot in the group determined by --group-by and not newer than the timestamp determined by --time)")
 	opts.GroupBy = data.SnapshotGroupByOptions{Host: true, Path: true}
 	f.VarP(&opts.GroupBy, "group-by", "g", "`group` snapshots by host, paths and/or tags, separated by comma (disable grouping with '')")
 	f.BoolVarP(&opts.Force, "force", "f", false, `force re-reading the source files/directories (overrides the "parent" flag)`)
@@ -464,13 +464,17 @@ func collectTargets(opts BackupOptions, args []string, warnf func(msg string, ar
 	return filterExisting(targets, warnf)
 }
 
-// findParentSnapshots returns the parent snapshots, the primary one first. If
-// there is none, nil is returned.
-func findParentSnapshots(ctx context.Context, repo restic.ListerLoaderUnpacked, opts BackupOptions, targets []string, timeStampLimit time.Time) ([]*data.Snapshot, error) {
+// parent returns the ID of the parent snapshot. If there is none, nil is
+// returned.
+func findParentSnapshot(ctx context.Context, repo restic.ListerLoaderUnpacked, opts BackupOptions, targets []string, timeStampLimit time.Time) (*data.Snapshot, error) {
 	if opts.Force {
 		return nil, nil
 	}
 
+	snName := opts.Parent
+	if snName == "" {
+		snName = "latest"
+	}
 	f := data.SnapshotFilter{TimestampLimit: timeStampLimit}
 	if opts.GroupBy.Host {
 		f.Hosts = []string{opts.Host}
@@ -482,24 +486,12 @@ func findParentSnapshots(ctx context.Context, repo restic.ListerLoaderUnpacked, 
 		f.Tags = []data.TagList{opts.Tags.Flatten()}
 	}
 
-	if len(opts.Parents) == 0 {
-		sn, _, err := f.FindLatest(ctx, repo, repo, "latest")
-		// Snapshot not found is ok if no explicit parent was set
-		if errors.Is(err, data.ErrNoSnapshotFound) {
-			return nil, nil
-		}
-		return []*data.Snapshot{sn}, err
+	sn, _, err := f.FindLatest(ctx, repo, repo, snName)
+	// Snapshot not found is ok if no explicit parent was set
+	if opts.Parent == "" && errors.Is(err, data.ErrNoSnapshotFound) {
+		err = nil
 	}
-
-	var parents []*data.Snapshot
-	for _, snName := range opts.Parents {
-		sn, _, err := f.FindLatest(ctx, repo, repo, snName)
-		if err != nil {
-			return nil, err
-		}
-		parents = append(parents, sn)
-	}
-	return parents, nil
+	return sn, err
 }
 
 // openResumeJournal opens the journal of directories completed by an earlier,
@@ -587,10 +579,10 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		return err
 	}
 
-	var parentSnapshots []*data.Snapshot
+	var parentSnapshot *data.Snapshot
 	var journal *archiver.ResumeJournal
 	if !opts.Stdin {
-		parentSnapshots, err = findParentSnapshots(ctx, repo, opts, targets, timeStamp)
+		parentSnapshot, err = findParentSnapshot(ctx, repo, opts, targets, timeStamp)
 		if err != nil {
 			return err
 		}
@@ -601,12 +593,12 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		}
 
 		if !gopts.JSON {
-			for _, sn := range parentSnapshots {
-				printer.P("using parent snapshot %v\n", sn.ID().Str())
-			}
 			if journal.Len() > 0 {
 				printer.P("resuming interrupted backup, %d directories were already completed\n", journal.Len())
-			} else if len(parentSnapshots) == 0 {
+			}
+			if parentSnapshot != nil {
+				printer.P("using parent snapshot %v\n", parentSnapshot.ID().Str())
+			} else if journal.Len() == 0 {
 				printer.P("no parent snapshot found, will read all files\n")
 			}
 		}
@@ -730,7 +722,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		BackupStart:     backupStart,
 		Time:            timeStamp,
 		Hostname:        opts.Host,
-		ParentSnapshots: parentSnapshots,
+		ParentSnapshot:  parentSnapshot,
 		ProgramVersion:  "restic " + global.Version,
 		SkipIfUnchanged: opts.SkipIfUnchanged,
 	}

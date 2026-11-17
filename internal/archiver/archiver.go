@@ -935,22 +935,21 @@ func resolveRelativeTargets(filesys fs.FS, targets []string) ([]backupTarget, er
 
 // SnapshotOptions collect attributes for a new snapshot.
 type SnapshotOptions struct {
-	Tags        data.TagList
-	Hostname    string
-	Excludes    []string
-	BackupStart time.Time
-	Time        time.Time
-	// ParentSnapshots are consulted in order to find unchanged files. The
-	// first one is recorded as the parent of the new snapshot.
-	ParentSnapshots []*data.Snapshot
-	ProgramVersion  string
+	Tags           data.TagList
+	Hostname       string
+	Excludes       []string
+	BackupStart    time.Time
+	Time           time.Time
+	ParentSnapshot *data.Snapshot
+	ProgramVersion string
 	// SkipIfUnchanged omits the snapshot creation if it is identical to the parent snapshot.
 	SkipIfUnchanged bool
 }
 
-// packFlushInterval is how often partially filled packs are uploaded while a
-// resume journal is in use. It bounds the work lost by an interruption.
-var packFlushInterval = 5 * time.Minute
+// treePackFlushInterval is how often partially filled tree packs are uploaded
+// while a resume journal is in use. It matches the maximum age of an index and
+// bounds the work lost by an interruption.
+var treePackFlushInterval = 10 * time.Minute
 
 // treeSaved is called by the tree workers for every directory that was saved.
 func (arch *Archiver) treeSaved(ctx context.Context, snPath string, id restic.ID) {
@@ -961,9 +960,9 @@ func (arch *Archiver) treeSaved(ctx context.Context, snPath string, id restic.ID
 
 	// Packs are only uploaded once they are full, which takes very long for
 	// tree packs. Without flushing them, the journaled trees would be lost
-	// when the backup is interrupted.
+	// when the backup is interrupted. Data packs fill up quickly on their own.
 	arch.mu.Lock()
-	due := time.Since(arch.lastPackFlush) >= packFlushInterval
+	due := time.Since(arch.lastPackFlush) >= treePackFlushInterval
 	if due {
 		arch.lastPackFlush = time.Now()
 	}
@@ -972,22 +971,19 @@ func (arch *Archiver) treeSaved(ctx context.Context, snPath string, id restic.ID
 		return
 	}
 	if f, ok := arch.Repo.(interface {
-		FlushPendingPacks(ctx context.Context) error
+		FlushTreePacks(ctx context.Context) error
 	}); ok {
-		if err := f.FlushPendingPacks(ctx); err != nil {
-			debug.Log("flushing packs failed: %v", err)
+		if err := f.FlushTreePacks(ctx); err != nil {
+			debug.Log("flushing tree packs failed: %v", err)
 		}
 	}
 }
 
-// loadParentTrees loads the root trees of the parent snapshots and of the
+// loadParentTrees loads the root trees of the parent snapshot and of the
 // resume journal. Trees that cannot be loaded are reported and skipped.
-func (arch *Archiver) loadParentTrees(ctx context.Context, parents []*data.Snapshot) []parentTree {
+func (arch *Archiver) loadParentTrees(ctx context.Context, sn *data.Snapshot) []parentTree {
 	var roots []parentNode
-	for _, sn := range parents {
-		if sn.Tree == nil {
-			continue
-		}
+	if sn != nil && sn.Tree != nil {
 		roots = append(roots, parentNode{node: &data.Node{Type: data.NodeTypeDir, Subtree: sn.Tree}})
 	}
 	trees, err := arch.loadSubtrees(ctx, "/", roots)
@@ -1044,7 +1040,7 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 			arch.runWorkers(wgCtx, wg, uploader)
 
 			debug.Log("starting snapshot")
-			fn, nodeCount, err := arch.saveTree(wgCtx, "/", atree, arch.loadParentTrees(wgCtx, opts.ParentSnapshots), func(_ *data.Node, is ItemStats) {
+			fn, nodeCount, err := arch.saveTree(wgCtx, "/", atree, arch.loadParentTrees(wgCtx, opts.ParentSnapshot), func(_ *data.Node, is ItemStats) {
 				arch.trackItem("/", nil, nil, is, time.Since(start))
 			})
 			if err != nil {
@@ -1082,8 +1078,8 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 		return nil, restic.ID{}, nil, err
 	}
 
-	if len(opts.ParentSnapshots) > 0 && opts.SkipIfUnchanged {
-		ps := opts.ParentSnapshots[0]
+	if opts.ParentSnapshot != nil && opts.SkipIfUnchanged {
+		ps := opts.ParentSnapshot
 		if ps.Tree != nil && rootTreeID.Equal(*ps.Tree) {
 			arch.summary.BackupEnd = time.Now()
 			return nil, restic.ID{}, arch.summary, nil
@@ -1097,8 +1093,8 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 
 	sn.ProgramVersion = opts.ProgramVersion
 	sn.Excludes = opts.Excludes
-	if len(opts.ParentSnapshots) > 0 {
-		sn.Parent = opts.ParentSnapshots[0].ID()
+	if opts.ParentSnapshot != nil {
+		sn.Parent = opts.ParentSnapshot.ID()
 	}
 	sn.Tree = &rootTreeID
 	arch.summary.BackupEnd = time.Now()

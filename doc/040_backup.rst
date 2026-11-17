@@ -205,20 +205,15 @@ is possible to manually specify a specific parent snapshot using the
 ``--parent`` option. Finally, note that one would normally set the
 ``--group-by`` option for the ``forget`` command to the same value.
 
-The ``--parent`` option can be specified multiple times. For each file, restic
-then uses the first of the given snapshots that contains an unchanged version
-of the file. This is for example useful to back up a folder for the first time
-after its subfolders were backed up separately. The first given snapshot is
-recorded as the parent of the new snapshot.
-
 If a backup is interrupted, the next backup of the same paths from the same
 host continues where the interrupted one left off: files in directories that
 were already completely processed are not read again, provided that they did
 not change in the meantime. For this, restic keeps a small encrypted journal
 of the completed directories in its local cache, which is removed once a
 backup completes. Resuming therefore requires the cache and is not used
-together with ``--force`` or ``--dry-run``. Data processed within roughly
-the last five minutes before the interruption may have to be read again.
+together with ``--force`` or ``--dry-run``. Data processed within about
+the last twenty minutes before the interruption may have to be read again, and
+running ``prune`` in between removes the data needed for resuming.
 The statistics of a resumed backup are still relative to the parent snapshot:
 files that were already uploaded by the interrupted backup are reported as
 new or changed, although they are not read again. If two backups of the same

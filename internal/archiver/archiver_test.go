@@ -2003,7 +2003,7 @@ func TestArchiverParent(t *testing.T) {
 
 			opts = test.opts
 			opts.Time = time.Now()
-			opts.ParentSnapshots = []*data.Snapshot{firstSnapshot}
+			opts.ParentSnapshot = firstSnapshot
 			testFS.bytesRead = map[string]int{}
 			secondSnapshot, secondSnapshotID, summary, err := arch.Snapshot(ctx, []string{"."}, opts)
 			if err != nil {
@@ -2413,9 +2413,9 @@ func snapshot(t testing.TB, repo archiverRepo, fs fs.FS, parent *data.Snapshot, 
 
 	arch := New(repo, fs, Options{})
 
-	sopts := SnapshotOptions{Time: time.Now()}
-	if parent != nil {
-		sopts.ParentSnapshots = []*data.Snapshot{parent}
+	sopts := SnapshotOptions{
+		Time:           time.Now(),
+		ParentSnapshot: parent,
 	}
 	snapshot, _, _, err := arch.Snapshot(ctx, []string{filename}, sopts)
 	rtest.OK(t, err)

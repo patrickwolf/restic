@@ -649,14 +649,11 @@ func (r *Repository) flushBlobSaver() {
 	r.blobSaver = nil
 }
 
-// FlushPendingPacks queues all partially filled packs for upload, such that
+// FlushTreePacks queues the partially filled tree packs for upload, such that
 // their blobs survive if the process is interrupted later on. It must only be
 // called from within the callback of WithBlobUploader.
-func (r *Repository) FlushPendingPacks(ctx context.Context) error {
-	if err := r.treePM.Flush(ctx); err != nil {
-		return err
-	}
-	return r.dataPM.Flush(ctx)
+func (r *Repository) FlushTreePacks(ctx context.Context) error {
+	return r.treePM.Flush(ctx)
 }
 
 // FlushPacks saves all remaining packs.

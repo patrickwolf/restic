@@ -31,7 +31,7 @@ func TestSnapshot(t testing.TB, repo restic.Repository, path string, parent *res
 		if err != nil {
 			t.Fatal(err)
 		}
-		opts.ParentSnapshots = []*data.Snapshot{sn}
+		opts.ParentSnapshot = sn
 	}
 	sn, _, _, err := arch.Snapshot(context.TODO(), []string{path}, opts)
 	if err != nil {
